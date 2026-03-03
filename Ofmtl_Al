@@ -1,0 +1,212 @@
+"""
+OFMTL-AL: Online Federated Multi-task Learning with Adaptive Loss
+Core algorithm implementation
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import List, Dict, Optional, Tuple
+import time
+
+class AdaptiveLossFunction:
+    """Adaptive loss implementation for noise robustness"""
+    
+    @staticmethod
+    def compute_adaptive_weights(f2_values: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+        """
+        Compute adaptive weights d_i as per Equation (14)
+        
+        Args:
+            f2_values: Values of f2 component
+            tau: Adaptive loss parameter τ
+            
+        Returns:
+            Adaptive weights d_i
+        """
+        f2_norm = torch.norm(f2_values, p=2)
+        numerator = f2_norm + 2 * tau
+        denominator = 2 * (f2_norm + tau) ** 2
+        d_i = (1 + tau) * numerator / denominator
+        return d_i
+
+class OFMTLAL:
+    """
+    Online Federated Multi-task Learning with Adaptive Loss
+    
+    This implementation follows the algorithm described in:
+    "OFMTL-AL: Robust Online Federated Multi-task Learning with Adaptive Loss"
+    """
+    
+    def __init__(self, lambda_reg: float = 0.1, tau: float = 1.0):
+        """
+        Initialize OFMTL-AL system
+        
+        Args:
+            lambda_reg: Regularization parameter
+            tau: Adaptive loss parameter τ
+        """
+        self.devices = []
+        self.model_reprs = []
+        self.Omega = None
+        self.lambda_reg = lambda_reg
+        self.tau = tau
+        self.d_features = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+    def add_device(self, X: np.ndarray, y: np.ndarray, X_test: np.ndarray, y_test: np.ndarray) -> Tuple[float, float]:
+        """
+        Add a new device with adaptive loss optimization
+        
+        Args:
+            X: Training features
+            y: Training labels
+            X_test: Test features
+            y_test: Test labels
+            
+        Returns:
+            error: Test error
+            training_time: Time taken for training
+        """
+        start_time = time.time()
+        
+        # Convert to tensors
+        X_tensor = torch.FloatTensor(X).to(self.device)
+        y_tensor = torch.LongTensor(y).to(self.device)
+        
+        # Initialize model
+        if self.d_features is None:
+            self.d_features = X.shape[1]
+        num_classes = len(np.unique(y))
+        
+        model = self._create_model(self.d_features, num_classes).to(self.device)
+        
+        if len(self.devices) > 0:
+            # Transfer learning: initialize with average of existing models
+            self._initialize_from_existing(model)
+        
+        # Train with adaptive loss
+        self._train_with_adaptive_loss(model, X_tensor, y_tensor)
+        
+        # Store model representation
+        model_repr = self._get_model_representation(model)
+        self.model_reprs.append(model_repr)
+        
+        # Update precision matrix
+        if len(self.model_reprs) > 1:
+            self._update_precision_matrix()
+        
+        # Evaluate
+        error = self._evaluate(model, X_test, y_test)
+        training_time = time.time() - start_time
+        
+        self.devices.append({
+            'model': model,
+            'error': error,
+            'time': training_time,
+            'data_size': X.shape[0]
+        })
+        
+        return error, training_time
+    
+    def _create_model(self, input_dim: int, num_classes: int) -> nn.Module:
+        """Create neural network model"""
+        return nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, num_classes)
+        )
+    
+    def _get_model_representation(self, model: nn.Module) -> torch.Tensor:
+        """Get reduced representation for precision matrix"""
+        params = []
+        for param in model.parameters():
+            params.append(param.data.flatten()[:50])
+        return torch.cat(params)[:100]
+    
+    def _initialize_from_existing(self, model: nn.Module):
+        """Initialize new model with average of existing models"""
+        with torch.no_grad():
+            avg_params = []
+            for i, param in enumerate(self.devices[0]['model'].parameters()):
+                param_sum = torch.zeros_like(param.data)
+                for device_info in self.devices:
+                    device_params = list(device_info['model'].parameters())
+                    param_sum += device_params[i].data
+                avg_params.append(param_sum / len(self.devices))
+            
+            for model_param, avg_param in zip(model.parameters(), avg_params):
+                model_param.data.copy_(avg_param)
+    
+    def _train_with_adaptive_loss(self, model: nn.Module, X: torch.Tensor, y: torch.Tensor, epochs: int = 30):
+        """Train with adaptive loss weighting"""
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss(reduction='none')
+        
+        dataset = torch.utils.data.TensorDataset(X, y)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch_X, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = model(batch_X)
+                
+                # Standard loss per sample
+                per_sample_loss = criterion(outputs, batch_y)
+                
+                # Compute adaptive weights for this batch
+                with torch.no_grad():
+                    # Simplified f2 computation
+                    f2_values = torch.norm(batch_X, dim=1)
+                    d_i = AdaptiveLossFunction.compute_adaptive_weights(f2_values, self.tau)
+                
+                # Weighted loss
+                loss = (d_i * per_sample_loss).mean()
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+    
+    def _update_precision_matrix(self):
+        """Update precision matrix based on model representations"""
+        if len(self.model_reprs) < 2:
+            return
+            
+        # Stack representations
+        W_reduced = torch.stack(self.model_reprs, dim=1)
+        m = W_reduced.shape[1]
+        
+        # Compute covariance
+        W_centered = W_reduced - torch.mean(W_reduced, dim=1, keepdim=True)
+        
+        if W_reduced.shape[0] > m:
+            covariance = torch.matmul(W_centered, W_centered.T) / m
+        else:
+            covariance = torch.matmul(W_centered.T, W_centered) / m
+            
+        # Add regularization
+        covariance += torch.eye(covariance.shape[0], device=self.device) * 1e-6
+        
+        try:
+            self.Omega = torch.inverse(covariance)
+            # Normalize
+            trace_val = torch.trace(torch.inverse(self.Omega))
+            self.Omega = self.Omega / trace_val
+        except:
+            self.Omega = torch.eye(m, device=self.device) * 0.1
+    
+    def _evaluate(self, model: nn.Module, X_test: np.ndarray, y_test: np.ndarray) -> float:
+        """Evaluate model on test data"""
+        model.eval()
+        with torch.no_grad():
+            test_tensor = torch.FloatTensor(X_test).to(self.device)
+            outputs = model(test_tensor)
+            predictions = outputs.argmax(1).cpu().numpy()
+            error = 1 - np.mean(predictions == y_test)
+        return error
